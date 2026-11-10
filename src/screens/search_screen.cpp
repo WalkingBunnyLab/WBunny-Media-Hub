@@ -1,0 +1,279 @@
+// Search everything at once: Bilibili, Jellyfin, Twitch, radio and podcasts.
+#include "core/i18n.hpp"
+#include "core/store.hpp"
+#include "core/tasks.hpp"
+#include "core/util.hpp"
+#include "player/player.hpp"
+#include "screens/screens.hpp"
+#include "screens/widgets.hpp"
+#include "services/jellyfin.hpp"
+#include "services/navidrome.hpp"
+#include "services/podcasts.hpp"
+#include "services/radio.hpp"
+#include "services/twitch.hpp"
+#include "services/bilibili.hpp"
+#include "screens/bilibili_common.hpp"
+#include "ui/ui.hpp"
+
+namespace screens {
+
+namespace {
+
+using namespace ui;
+
+class SearchScreen : public app::Screen {
+public:
+    app::Section section() const override { return app::SEC_SEARCH; }
+
+    void frame() override {
+        const Theme& t = theme();
+        float x0 = content_x();
+        Id g = id("search");
+        page_.begin(id(g, "page"));
+        float y = page_.y(52);
+        text::draw(font::display, x0, y, tr("Search"), t.text);
+        y += 74;
+        Id top = id(g, "top");
+        if (search_bar(id(top, "bar"), Rect(x0, y, W - x0 - 40, 48), query_,
+                       tr("Movies, videos, channels, stations, podcasts\xE2\x80\xA6"), top, F_DEFAULT))
+            open_keyboard();
+        y += 68;
+        if (focus_in_group(top)) page_.focus_range(0, y + page_.scroll());
+
+        if (query_.empty()) {
+            auto recent = store::recent_searches("global");
+            if (!recent.empty()) {
+                text::draw(font::title, x0, y, tr("Recent searches"), t.text);
+                y += 50;
+                float cx = x0;
+                Id rg = id(g, "recent");
+                for (size_t i = 0; i < recent.size() && i < 10; i++) {
+                    float w = text::measure(font::small_bold, recent[i]) + 58;
+                    if (cx + w > W - 60) {
+                        cx = x0;
+                        y += 54;
+                    }
+                    if (chip(id(rg, (int64_t)i), Rect(cx, y, w, 42), recent[i].c_str(), false, rg, ic::HISTORY)) run(recent[i]);
+                    cx += w + 12;
+                }
+                y += 70;
+            } else {
+                empty_state(Rect(x0, y, W - x0 - 40, 260), ic::SEARCH, tr("Find anything"),
+                            tr("One search looks through everything you have turned on."));
+                y += 300;
+            }
+            page_.end(y + page_.scroll());
+            return;
+        }
+
+        bool any = false, loading = false;
+        if (!jf_.empty() || jf_loading_) {
+            any = true;
+            ShelfSpec s;
+            s.title = tr("In your Jellyfin library");
+            s.count = (int)jf_.size();
+            s.loading = jf_loading_;
+            s.shape = CARD_POSTER;
+            s.item_w = 150;
+            s.item = [this](int i) {
+                CardInfo c;
+                c.image = jellyfin::poster(jf_[i], 300);
+                c.title = jf_[i].name;
+                c.subtitle = jf_[i].type == "Episode" ? jf_[i].series_name : jf_[i].year;
+                c.icon = ic::VIDEO_LIBRARY;
+                return c;
+            };
+            s.on_click = [this](int i) {
+                const jellyfin::Item& it = jf_[i];
+                if (it.type == "Episode") play_jellyfin_video(it);
+                else if (it.is_audio()) play_audio(jellyfin::make_source(it));
+                else app::push(make_jellyfin_item(it));
+            };
+            y += shelf(id(g, "jf"), x0, y, s, &page_) + 10;
+        }
+        if (!nd_songs_.empty() || nd_loading_) {
+            any = true;
+            ShelfSpec s;
+            s.title = tr("Navidrome music");
+            s.count = (int)nd_songs_.size();
+            s.loading = nd_loading_;
+            s.shape = CARD_WIDE;
+            s.item_w = 280;
+            s.item = [this](int i) {
+                const navidrome::Song& sg = nd_songs_[i];
+                CardInfo c;
+                c.image = navidrome::cover_art_url(sg.cover_art.empty() ? sg.album_id : sg.cover_art, 300);
+                c.title = sg.title;
+                c.subtitle = sg.artist.empty() ? sg.album : sg.artist;
+                c.icon = ic::LIBRARY_MUSIC;
+                c.badge = util::format_duration(sg.duration);
+                return c;
+            };
+            s.on_click = [this](int i) {
+                play_audio(navidrome::make_source(nd_songs_[i]));
+            };
+            y += shelf(id(g, "nd_songs"), x0, y, s, &page_) + 10;
+        }
+        if (!bili_.empty() || bili_loading_) {
+            any = true;
+            ShelfSpec s;
+            s.title = "Bilibili";
+            s.count = (int)bili_.size();
+            s.loading = bili_loading_;
+            s.item_w = 268;
+            s.item = [this](int i) { return bili::video_card(bili_[i]); };
+            s.on_click = [this](int i) { bili::open(bili_[i]); };
+            s.on_focus = [this](int i) { set_backdrop(bili_[i].picture); };
+            y += shelf(id(g, "bilibili"), x0, y, s, &page_) + 10;
+        }
+        if (!tw_.empty() || tw_loading_) {
+            any = true;
+            ShelfSpec s;
+            s.title = tr("Twitch channels");
+            s.count = (int)tw_.size();
+            s.loading = tw_loading_;
+            s.shape = CARD_CIRCLE;
+            s.item_w = 130;
+            s.item = [this](int i) {
+                CardInfo c;
+                c.image = tw_[i].avatar;
+                c.title = tw_[i].name;
+                c.live = tw_[i].live;
+                c.icon = ic::LIVE_TV;
+                return c;
+            };
+            s.on_click = [this](int i) {
+                if (tw_[i].live) play_video(twitch::make_source(tw_[i]));
+                else toast(util::fmt(tr("%s is offline"), tw_[i].name.c_str()), ic::INFO);
+            };
+            y += shelf(id(g, "tw"), x0, y, s, &page_) + 10;
+        }
+        if (!radio_.empty() || radio_loading_) {
+            any = true;
+            ShelfSpec s;
+            s.title = tr("Radio stations");
+            s.count = (int)radio_.size();
+            s.loading = radio_loading_;
+            s.shape = CARD_SQUARE;
+            s.item_w = 160;
+            s.item = [this](int i) {
+                CardInfo c;
+                c.image = radio_[i].favicon;
+                c.title = radio_[i].name;
+                c.subtitle = radio_[i].country;
+                c.icon = ic::RADIO;
+                return c;
+            };
+            s.on_click = [this](int i) { play_audio(radio::make_source(radio_[i])); };
+            y += shelf(id(g, "radio"), x0, y, s, &page_) + 10;
+        }
+        if (!pods_.empty() || pods_loading_) {
+            any = true;
+            ShelfSpec s;
+            s.title = tr("Podcasts");
+            s.count = (int)pods_.size();
+            s.loading = pods_loading_;
+            s.shape = CARD_SQUARE;
+            s.item_w = 160;
+            s.item = [this](int i) {
+                CardInfo c;
+                c.image = pods_[i].artwork;
+                c.title = pods_[i].title;
+                c.subtitle = pods_[i].author;
+                c.icon = ic::PODCASTS;
+                return c;
+            };
+            s.on_click = [this](int i) {
+                const podcasts::Show& p = pods_[i];
+                app::push(make_podcast_show(p.feed_url, p.title, p.author, p.artwork));
+            };
+            y += shelf(id(g, "pods"), x0, y, s, &page_) + 10;
+        }
+        loading = jf_loading_ || nd_loading_ || bili_loading_ || tw_loading_ || radio_loading_ || pods_loading_;
+        if (!any && !loading) {
+            empty_state(Rect(x0, y, W - x0 - 40, 260), ic::SEARCH, tr("No results"),
+                        errors_.empty() ? tr("Try different words.") : errors_.c_str());
+            y += 300;
+        }
+        page_.end(y + page_.scroll());
+        hint_bar({{"A", tr("Open")}, {"B", tr("Back")}});
+    }
+
+private:
+    void open_keyboard() {
+        prompt_text(tr("Search"), query_, tr("Search everything"), [this](std::string q) {
+            if (!q.empty()) run(q);
+        });
+    }
+
+    void run(const std::string& q) {
+        query_ = q;
+        store::add_recent_search("global", q);
+        scope_.reset();
+        errors_.clear();
+        jf_.clear();
+        nd_songs_.clear();
+        bili_.clear();
+        tw_.clear();
+        radio_.clear();
+        pods_.clear();
+        // Only what is turned on in Settings > Make it yours is searched.
+        const bool bili_on = app::section_visible(app::SEC_BILIBILI), tw_on = app::section_visible(app::SEC_TWITCH),
+                   radio_on = app::section_visible(app::SEC_RADIO), pods_on = app::section_visible(app::SEC_PODCASTS);
+        jf_loading_ = app::section_visible(app::SEC_JELLYFIN) && jellyfin::signed_in();
+        nd_loading_ = app::section_visible(app::SEC_NAVIDROME) && navidrome::signed_in();
+        bili_loading_ = bili_on;
+        tw_loading_ = tw_on;
+        radio_loading_ = radio_on;
+        pods_loading_ = pods_on;
+        if (jf_loading_)
+            scope_.run<jellyfin::List>([q] { return jellyfin::search(q); }, [this](jellyfin::List l) {
+                jf_ = std::move(l.items);
+                jf_loading_ = false;
+            });
+        if (nd_loading_)
+            scope_.run<navidrome::List>([q] { return navidrome::search(q, 20); }, [this](navidrome::List l) {
+                nd_songs_ = std::move(l.songs);
+                nd_loading_ = false;
+            });
+        if (bili_on) {
+            scope_.run<bilibili::List>([q] { return bilibili::search(q); }, [this](bilibili::List r) {
+                bili_ = std::move(r.items);
+                if (!r.error.empty()) errors_ = r.error;
+                bili_loading_ = false;
+            });
+        }
+        if (tw_on)
+            scope_.run<twitch::Streams>([q] { return twitch::search(q); }, [this](twitch::Streams s) {
+                tw_ = std::move(s.items);
+                tw_loading_ = false;
+            });
+        if (radio_on)
+            scope_.run<radio::List>([q] { return radio::search(q, 30); }, [this](radio::List l) {
+                radio_ = std::move(l.items);
+                radio_loading_ = false;
+            });
+        if (pods_on)
+            scope_.run<podcasts::Shows>([q] { return podcasts::search(q); }, [this](podcasts::Shows s) {
+                pods_ = std::move(s.items);
+                pods_loading_ = false;
+            });
+    }
+
+    std::string query_, errors_;
+    std::vector<jellyfin::Item> jf_;
+    std::vector<navidrome::Song> nd_songs_;
+    std::vector<bilibili::Video> bili_;
+    std::vector<twitch::Stream> tw_;
+    std::vector<radio::Station> radio_;
+    std::vector<podcasts::Show> pods_;
+    bool jf_loading_ = false, nd_loading_ = false, bili_loading_ = false, tw_loading_ = false, radio_loading_ = false, pods_loading_ = false;
+    tasks::Scope scope_;
+    Page page_;
+};
+
+}  // namespace
+
+std::unique_ptr<app::Screen> make_search() { return std::make_unique<SearchScreen>(); }
+
+}  // namespace screens

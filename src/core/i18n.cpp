@@ -1,0 +1,185 @@
+#include "core/i18n.hpp"
+
+#include <atomic>
+#include <cstdio>
+#include <cstring>
+#include <deque>
+#include <map>
+#include <memory>
+#include <mutex>
+#include <string_view>
+#include <unordered_map>
+
+#include "core/json.hpp"
+#include "core/store.hpp"
+#include "core/util.hpp"
+#include "logger/logger.hpp"
+#include "platform/platform.hpp"
+
+namespace i18n {
+
+const Language LANGUAGES[] = {
+    {"en", "English", N_("English")},
+    {"ja", "\xE6\x97\xA5\xE6\x9C\xAC\xE8\xAA\x9E", N_("Japanese")},
+    {"zh", "\xE7\xAE\x80\xE4\xBD\x93\xE4\xB8\xAD\xE6\x96\x87", N_("Chinese")},
+};
+const int LANGUAGE_COUNT = sizeof(LANGUAGES) / sizeof(LANGUAGES[0]);
+
+namespace {
+
+struct Catalog {
+    std::deque<std::string> text;  // keys and values; a deque never moves them
+    std::unordered_map<std::string_view, const char*> map;
+};
+
+std::string g_content, g_chosen;
+const Language* g_current = &LANGUAGES[0];
+const Language* g_system = &LANGUAGES[0];
+std::atomic<const Catalog*> g_catalog{nullptr};
+std::atomic<int> g_generation{0};
+// Loaded catalogs stay until the app closes: other threads may still hold their text.
+std::mutex g_mutex;
+std::map<std::string, std::unique_ptr<Catalog>> g_loaded;
+
+const Language* find(const std::string& code) {
+    for (int i = 0; i < LANGUAGE_COUNT; i++)
+        if (code == LANGUAGES[i].code) return &LANGUAGES[i];
+    return nullptr;
+}
+
+// The printf conversions in s ("%s of %d" -> "sd"), which a translation has to keep, in order.
+std::string conversions(const char* s) {
+    std::string out;
+    for (const char* p = s; *p; p++) {
+        if (*p != '%') continue;
+        p++;
+        if (*p == '%') continue;
+        while (*p && strchr("-+ #0123456789.*", *p)) p++;
+        while (*p && strchr("hljztL", *p)) out += *p++;
+        if (!*p) break;
+        out += *p;
+    }
+    return out;
+}
+
+const Catalog* load(const Language& lang) {
+    std::lock_guard<std::mutex> lock(g_mutex);
+    auto it = g_loaded.find(lang.code);
+    if (it != g_loaded.end()) return it->second.get();
+    auto cat = std::make_unique<Catalog>();
+    std::string path = g_content + "/lang/" + lang.code + ".json", body;
+    json::Doc doc = util::read_file(path, body) ? json::Doc::parse(body) : json::Doc();
+    if (!json_is_object(doc.get())) {
+        log_message(LOG_WARNING, "Language", "No translations in %s", path.c_str());
+    } else {
+        const char* key;
+        json_t* value;
+        int skipped = 0;
+        json_object_foreach(doc.get(), key, value) {
+            const char* v = json_string_value(value);
+            if (!v || !*v) continue;
+            // A translation that formats differently could read the wrong arguments: English instead.
+            if (conversions(key) != conversions(v)) {
+                skipped++;
+                continue;
+            }
+            const std::string& k = cat->text.emplace_back(key);
+            cat->map[k] = cat->text.emplace_back(v).c_str();
+        }
+        log_message(skipped ? LOG_WARNING : LOG_OK, "Language", "%s: %zu translations%s", lang.english, cat->map.size(),
+                    skipped ? util::fmt(", %d left out (their %% codes don't match)", skipped).c_str() : "");
+    }
+    return (g_loaded[lang.code] = std::move(cat)).get();
+}
+
+void apply() {
+    const Language* lang = find(g_chosen);
+    g_current = lang ? lang : g_system;
+    g_catalog = g_current == &LANGUAGES[0] ? nullptr : load(*g_current);
+    g_generation++;
+}
+
+}  // namespace
+
+void init(const std::string& content_dir) {
+    g_content = content_dir;
+    std::string sys = platform::system_language();
+    // The console's Traditional Chinese gets the Simplified text rather than none.
+    if (sys.rfind("zh", 0) == 0) sys = "zh";
+    const Language* s = find(sys);
+    g_system = s ? s : &LANGUAGES[0];
+    g_chosen = store::get_str("language");
+    if (!g_chosen.empty() && !find(g_chosen)) {
+        g_chosen = g_system->code;
+        store::set_str("language", g_chosen);
+    }
+    apply();
+    log_message(LOG_OK, "Language", "%s (the system's is %s)", g_current->english, sys.c_str());
+}
+
+const std::string& chosen() { return g_chosen; }
+
+void choose(const std::string& code) {
+    g_chosen = find(code) ? code : "";
+    store::set_str("language", g_chosen);
+    apply();
+}
+
+const Language& current() { return *g_current; }
+const Language& system() { return *g_system; }
+int generation() { return g_generation; }
+
+#ifdef __ANDROID__
+namespace {
+// The text is written for the Wii U ("your Wii U", "the SD card"): on Android the same words name the
+// TV box and its storage.
+const char* device_words(const char* text) {
+    if (!text || (!strstr(text, "Wii U") && !strstr(text, "SD card"))) return text;
+    static std::mutex m;
+    static std::unordered_map<std::string, std::string> cache;  // node-based: the strings stay put
+    std::lock_guard<std::mutex> lock(m);
+    auto it = cache.find(text);
+    if (it != cache.end()) return it->second.c_str();
+    std::string s = util::replace_all(text, "Wii U Menu", "Home screen");
+    s = util::replace_all(s, "Wii U", "Fire TV");
+    s = util::replace_all(s, "the SD card", "storage");
+    s = util::replace_all(s, "SD card", "storage");
+    return cache.emplace(text, std::move(s)).first->second.c_str();
+}
+}  // namespace
+#endif
+
+const char* tr(const char* english) {
+    const Catalog* cat = g_catalog;
+    const char* text = english;
+    if (cat && english) {
+        auto it = cat->map.find(english);
+        if (it != cat->map.end()) text = it->second;
+    }
+#ifdef __ANDROID__
+    return device_words(text);
+#else
+    return text;
+#endif
+}
+
+namespace {
+const char* const MONTHS[] = {N_("January"), N_("February"), N_("March"),     N_("April"),
+                              N_("May"),     N_("June"),     N_("July"),      N_("August"),
+                              N_("September"), N_("October"), N_("November"), N_("December")};
+}
+
+const char* month_name(int month) { return month >= 0 && month < 12 ? tr(MONTHS[month]) : ""; }
+
+std::string long_date(const std::string& iso) {
+    int y = 0, m = 0, d = 0;
+    if (sscanf(iso.c_str(), "%d-%d-%d", &y, &m, &d) != 3 || y < 1900 || y > 2999 || m < 1 || m > 12 || d < 1 || d > 31)
+        return "";
+    // Each language puts the parts in its own order.
+    std::string s = tr("{month} {day}, {year}");
+    s = util::replace_all(s, "{month}", month_name(m - 1));
+    s = util::replace_all(s, "{day}", std::to_string(d));
+    return util::replace_all(s, "{year}", std::to_string(y));
+}
+
+}  // namespace i18n

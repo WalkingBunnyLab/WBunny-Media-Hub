@@ -1,0 +1,62 @@
+#pragma once
+
+#include <cstdint>
+#include <ctime>
+#include <string>
+#include <string_view>
+#include <typeinfo>
+#include <vector>
+
+namespace util {
+
+std::string url_encode(std::string_view s);
+std::string url_decode(std::string_view s);
+std::string html_to_text(std::string_view html);  // strips tags, decodes entities
+std::string trim(std::string_view s);
+std::string lower(std::string_view s);
+bool starts_with(std::string_view s, std::string_view prefix);
+bool ends_with(std::string_view s, std::string_view suffix);
+bool icontains(std::string_view haystack, std::string_view needle);
+bool natural_less(std::string_view a, std::string_view b);  // "Episode 2" before "Episode 10"
+std::vector<std::string> split(std::string_view s, char sep);
+std::string replace_all(std::string s, std::string_view from, std::string_view to);
+std::string file_extension(std::string_view path);  // lower-case, without dot
+std::string file_name(std::string_view path);
+std::string parent_dir(std::string_view path);
+std::string join_path(std::string_view a, std::string_view b);
+
+std::string format_duration(double seconds);          // 1:02:03 / 4:05
+std::string format_count(int64_t n);                  // 1.2K, 3.4M
+std::string format_bytes(uint64_t n);
+std::string format_ticks_duration(int64_t ticks);     // .NET ticks (100ns) -> "1h 42m"
+std::string fmt(const char* format, ...) __attribute__((format(printf, 1, 2)));
+// A type's name as written in the code, for the log ("screens::VideoScreen").
+std::string type_name(const std::type_info& type);
+
+// The number of characters (not bytes) in UTF-8 text.
+inline size_t utf8_length(std::string_view s) {
+    size_t n = 0;
+    for (unsigned char c : s) n += (c & 0xC0) != 0x80;
+    return n;
+}
+uint64_t hash64(std::string_view s, uint64_t seed = 1469598103934665603ull);
+std::string random_hex(int bytes);  // for names and IDs: not for anything that keeps others out
+// Hex of bytes from the system's entropy source, for tokens that keep others out ("" without one).
+std::string secure_random_hex(int bytes);
+double now_seconds();          // monotonic
+int64_t unix_time();           // wall clock seconds
+std::string clock_hhmm();      // local time for the status bar
+// The local date and time as a calendar breakdown. COFFEEFLIX_NOW="2026-02-28 07:30" makes it that moment (tests).
+void local_tm(std::tm* out);
+
+// Environment override (used by the desktop test harness to point services at
+// local mocks); returns `def` when unset, which is always the case on Wii U.
+std::string env_or(const char* name, const std::string& def);
+
+bool file_exists(const std::string& path);
+bool dir_exists(const std::string& path);
+bool make_dirs(const std::string& path);
+bool read_file(const std::string& path, std::string& out);
+bool write_file_atomic(const std::string& path, std::string_view data);
+
+}  // namespace util

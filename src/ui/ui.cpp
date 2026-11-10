@@ -1,0 +1,923 @@
+#include "ui/ui.hpp"
+
+#include <algorithm>
+#include <cmath>
+#include <cstring>
+#include <deque>
+#include <unordered_map>
+#include <vector>
+
+#include "audio/mixer.hpp"
+#include "core/i18n.hpp"
+#include "core/util.hpp"
+#include "gfx/anim.hpp"
+#include "gfx/images.hpp"
+#include "platform/platform.hpp"
+
+namespace ui {
+
+namespace {
+
+struct Reg {
+    Id id;
+    Rect r;       // screen space
+    Rect clip;    // visible part (for touch)
+    Id group;
+    int layer;
+    int flags;
+};
+
+struct AnimState {
+    float v = 0;
+    anim::Spring s;
+    uint64_t last = 0;
+    bool init = false;
+};
+
+struct ScrollState {
+    float target = 0;
+    anim::Spring s;
+    bool init = false;
+    bool dragging = false;
+    float fling = 0;     // momentum after a swipe, px/s
+    bool free = false;   // swiped by touch: stop following the focused item until the D-pad is used
+    bool caught = false; // a touch stopped a fling; its release isn't a tap
+};
+
+struct Toast {
+    std::string msg;
+    int icon;
+    Color color;
+    double start;
+};
+
+Input* g_in = nullptr;
+float g_dt = 1.0f / 60.0f;
+double g_time = 0;
+uint64_t g_frame = 0;
+
+std::vector<Reg> g_cur, g_prev;
+Id g_focus = 0;
+int g_focus_grace = 0;  // frames to keep an explicitly set focus that isn't drawn yet
+Id g_last_focus_group = 0;
+int g_layer = 0;
+std::vector<int> g_layer_stack;
+bool g_nav_suspended = false;
+std::unordered_map<Id, Id> g_group_memory;
+std::unordered_map<Id, Id> g_group_entry;
+std::unordered_map<Id, AnimState> g_anim;
+std::unordered_map<Id, ScrollState> g_scroll;
+std::unordered_map<Id, float> g_press;
+bool g_touch_scrolled = false;  // a list was swiped since the D-pad was last used
+Id g_tap_target = 0;            // what this frame's tap lands on (see pick_tap_target)
+
+// bump feedback when navigation hits an edge
+Id g_bump_id = 0;
+float g_bump_dx = 0, g_bump_dy = 0;
+double g_bump_t = -10;
+
+std::deque<Toast> g_toasts;
+
+// backdrop crossfade
+std::string g_backdrop, g_prev_backdrop;
+double g_backdrop_t = -10;
+
+int g_accent = 0;
+Theme g_theme;
+
+struct Accent { const char* name; uint32_t a, b; };
+const Accent ACCENTS[] = {
+    {N_("Mint"), 0x51FFC1, 0xADEBD5},
+    {N_("Berry"), 0xFF4D8D, 0xA855F7},
+    {N_("Mint"), 0x2DD4BF, 0x22C55E},
+    {N_("Ocean"), 0x38BDF8, 0x6366F1},
+    {N_("Gold"), 0xFACC15, 0xF97316},
+};
+
+void build_theme() {
+    g_theme.bg_top = gfx::rgb(0x111513);
+    g_theme.bg_bottom = g_theme.bg_top;
+    g_theme.surface = gfx::rgb(0x191F1C);
+    g_theme.surface_hi = gfx::rgb(0x1D332D);
+    g_theme.border = gfx::rgb(0x34463E);
+    g_theme.surface_focus = gfx::rgb(0x51FFC1);
+    g_theme.text = gfx::rgb(0xE8EDE9);
+    g_theme.text2 = gfx::rgb(0xA2A89D);
+    g_theme.text3 = g_theme.text2;
+    g_theme.accent = gfx::rgb(ACCENTS[g_accent].a);
+    g_theme.accent2 = gfx::rgb(ACCENTS[g_accent].b);
+    g_theme.good = g_theme.accent;
+    g_theme.warn = g_theme.accent2;
+    g_theme.bad = g_theme.text2;
+}
+
+const Reg* find(const std::vector<Reg>& v, Id id) {
+    for (auto& r : v)
+        if (r.id == id) return &r;
+    return nullptr;
+}
+
+int top_layer(const std::vector<Reg>& v) {
+    int top = 0;
+    for (auto& r : v) top = std::max(top, r.layer);
+    return top;
+}
+
+// Spatial navigation: best candidate in direction (dx, dy).
+const Reg* pick(const std::vector<Reg>& v, const Reg& from, int dx, int dy, int layer) {
+    const Reg* best = nullptr;
+    float best_score = 1e30f;
+    const Rect& f = from.r;
+    for (auto& c : v) {
+        if (c.id == from.id || c.layer != layer) continue;
+        if ((c.flags & F_SIDE_ENTRY) && dy != 0 && c.group != from.group) continue;
+        if ((from.flags & F_SIDE_ENTRY) && dy != 0 && c.group != from.group) continue;  // up and down in a side rail stay in it
+        const Rect& r = c.r;
+        float primary, ortho_gap, center_diff;
+        if (dx > 0) {
+            if (r.cx() <= f.cx() + 1 || r.x < f.x + 1) continue;
+            primary = std::max(0.0f, r.x - f.r());
+            ortho_gap = std::max(0.0f, std::max(f.y, r.y) - std::min(f.b(), r.b()));
+            center_diff = std::fabs(r.cy() - f.cy());
+        } else if (dx < 0) {
+            if (r.cx() >= f.cx() - 1 || r.r() > f.r() - 1) continue;
+            primary = std::max(0.0f, f.x - r.r());
+            ortho_gap = std::max(0.0f, std::max(f.y, r.y) - std::min(f.b(), r.b()));
+            center_diff = std::fabs(r.cy() - f.cy());
+        } else if (dy > 0) {
+            if (r.cy() <= f.cy() + 1 || r.y < f.y + 1) continue;
+            primary = std::max(0.0f, r.y - f.b());
+            ortho_gap = std::max(0.0f, std::max(f.x, r.x) - std::min(f.r(), r.r()));
+            center_diff = std::fabs(r.cx() - f.cx());
+        } else {
+            if (r.cy() >= f.cy() - 1 || r.b() > f.b() - 1) continue;
+            primary = std::max(0.0f, f.y - r.b());
+            ortho_gap = std::max(0.0f, std::max(f.x, r.x) - std::min(f.r(), r.r()));
+            center_diff = std::fabs(r.cx() - f.cx());
+        }
+        float score = primary + ortho_gap * 3.0f + center_diff * 0.15f;
+        // Strongly prefer staying in the same group when overlapping.
+        if (c.group == from.group && ortho_gap == 0) score *= 0.8f;
+        if (score < best_score) {
+            best_score = score;
+            best = &c;
+        }
+    }
+    return best;
+}
+
+// How much of a registered rect is on screen and inside its clip.
+float visible_fraction(const Reg& r) {
+    float x0 = std::max({r.r.x, r.clip.x, 0.0f}), x1 = std::min({r.r.r(), r.clip.r(), (float)W});
+    float y0 = std::max({r.r.y, r.clip.y, 0.0f}), y1 = std::min({r.r.b(), r.clip.b(), (float)H});
+    if (x1 <= x0 || y1 <= y0 || r.r.w <= 0 || r.r.h <= 0) return 0;
+    return (x1 - x0) * (y1 - y0) / (r.r.w * r.r.h);
+}
+
+// A GamePad tap lands on what's under the finger, or failing that on the nearest thing within
+// a finger's width, so small buttons don't need a precise tap.
+Id pick_tap_target(float x, float y) {
+    constexpr float SLOP = 22.0f;
+    int top = top_layer(g_prev);
+    const Reg* best = nullptr;
+    float best_d = SLOP;
+    for (auto& r : g_prev) {
+        if (r.layer != top || !r.r.intersects(r.clip) || !r.clip.contains(x, y)) continue;
+        if (r.r.contains(x, y)) return r.id;  // an exact hit; the first one drawn wins, as before
+        float dx = std::max({r.r.x - x, 0.0f, x - r.r.r()}), dy = std::max({r.r.y - y, 0.0f, y - r.r.b()});
+        float d = std::sqrt(dx * dx + dy * dy);
+        if (d < best_d) {
+            best_d = d;
+            best = &r;
+        }
+    }
+    return best ? best->id : 0;
+}
+
+void do_navigation() {
+    if (!g_in) return;
+    int top = top_layer(g_cur);
+    const Reg* cur = find(g_cur, g_focus);
+
+    if (g_focus_grace > 0) {
+        g_focus_grace--;
+        if (!cur) return;  // the target screen appears next frame
+    }
+    // Keep focus valid: fall back to a default item in the top layer.
+    if (!cur || cur->layer != top) {
+        const Reg* def = nullptr;
+        // Prefer the remembered item of the last active group.
+        if (Id mem = group_memory(g_last_focus_group)) {
+            const Reg* m = find(g_cur, mem);
+            if (m && m->layer == top) def = m;
+        }
+        for (auto& r : g_cur)
+            if (!def && r.layer == top && (r.flags & F_DEFAULT)) def = &r;
+        for (auto& r : g_cur)
+            if (!def && r.layer == top && !(r.flags & F_SIDE_ENTRY)) def = &r;
+        for (auto& r : g_cur) {
+            if (def || r.layer != top) continue;
+            auto e = g_group_entry.find(r.group);
+            def = (e != g_group_entry.end()) ? find(g_cur, e->second) : &r;
+        }
+        if (def) {
+            g_focus = def->id;
+            g_last_focus_group = def->group;
+        }
+        return;
+    }
+    if (g_nav_suspended) return;
+
+    int dx = 0, dy = 0;
+    if (g_in->rep(BTN_LEFT)) dx = -1;
+    else if (g_in->rep(BTN_RIGHT)) dx = 1;
+    else if (g_in->rep(BTN_UP)) dy = -1;
+    else if (g_in->rep(BTN_DOWN)) dy = 1;
+    if (!dx && !dy) return;
+
+    if (g_touch_scrolled) {
+        // The D-pad takes over from a swipe: lists follow the focus again, and if the focused
+        // item was swiped off screen, the first press picks the nearest item that's in view.
+        g_touch_scrolled = false;
+        for (auto& kv : g_scroll) kv.second.free = false;
+        if (visible_fraction(*cur) < 0.5f) {
+            float px = std::clamp(cur->r.cx(), 0.0f, (float)W), py = std::clamp(cur->r.cy(), 0.0f, (float)H);
+            // Preferably in the same list (the swiped one), else anywhere.
+            const Reg* best = nullptr;
+            for (int pass = 0; pass < 2 && !best; pass++) {
+                float best_d = 1e30f;
+                for (auto& r : g_cur) {
+                    if (r.layer != top || visible_fraction(r) < 0.6f) continue;
+                    if (pass == 0 && (!cur->group || r.group != cur->group)) continue;
+                    float ddx = r.r.cx() - px, ddy = r.r.cy() - py;
+                    float d = ddx * ddx + ddy * ddy;
+                    if (d < best_d) {
+                        best_d = d;
+                        best = &r;
+                    }
+                }
+            }
+            if (best) {
+                g_focus = best->id;
+                g_last_focus_group = best->group;
+                if (best->group && !(best->flags & F_NO_MEMORY)) g_group_memory[best->group] = best->id;
+                audio::play(audio::SFX_MOVE);
+                return;
+            }
+        }
+    }
+
+    const Reg* next = pick(g_cur, *cur, dx, dy, top);
+    if (next && next->group != cur->group && next->group && g_group_entry.count(next->group)) {
+        const Reg* entry = find(g_cur, g_group_entry[next->group]);
+        if (entry && entry->layer == top) next = entry;
+    } else if (next && next->group != cur->group && next->group) {
+        // Entering another group: return to where we were in it.
+        auto it = g_group_memory.find(next->group);
+        if (it != g_group_memory.end()) {
+            const Reg* mem = find(g_cur, it->second);
+            if (mem && mem->layer == top) {
+                bool ok = (dx > 0 && mem->r.cx() > cur->r.cx()) || (dx < 0 && mem->r.cx() < cur->r.cx()) ||
+                          (dy > 0 && mem->r.cy() > cur->r.cy()) || (dy < 0 && mem->r.cy() < cur->r.cy());
+                if (ok) next = mem;
+            }
+        }
+    }
+    if (!next && dy != 0 && (cur->flags & F_WRAP) && cur->group) {  // off the end of a short list: round to the other end
+        for (auto& c : g_cur) {
+            if (c.id == cur->id || c.layer != top || c.group != cur->group || !(c.flags & F_WRAP)) continue;
+            if (!next || (dy > 0 ? c.r.cy() < next->r.cy() : c.r.cy() > next->r.cy())) next = &c;
+        }
+    }
+    if (next) {
+        if (cur->group && !(cur->flags & F_NO_MEMORY)) g_group_memory[cur->group] = cur->id;
+        g_focus = next->id;
+        g_last_focus_group = next->group;
+        if (next->group && !(next->flags & F_NO_MEMORY)) g_group_memory[next->group] = next->id;
+        if (!(next->flags & F_SILENT)) audio::play(audio::SFX_MOVE);
+    } else {
+        g_bump_id = g_focus;
+        g_bump_dx = (float)dx;
+        g_bump_dy = (float)dy;
+        g_bump_t = g_time;
+        audio::play(audio::SFX_BUMP, 0.5f);
+    }
+}
+
+AnimState& anim_state(Id id) {
+    AnimState& a = g_anim[id];
+    a.last = g_frame;
+    return a;
+}
+
+}  // namespace
+
+// --- ids ----------------------------------------------------------------------------
+
+Id id(const char* s) { return util::hash64(s); }
+Id id(Id parent, const char* s) { return util::hash64(s, parent * 1099511628211ull + 7); }
+Id id(Id parent, const std::string& s) { return util::hash64(s, parent * 1099511628211ull + 7); }
+Id id(Id parent, int64_t i) {
+    uint64_t h = parent ^ (0x9E3779B97F4A7C15ull + (uint64_t)i + (parent << 6) + (parent >> 2));
+    h ^= h >> 33;
+    h *= 0xff51afd7ed558ccdull;
+    h ^= h >> 33;
+    return h;
+}
+
+// --- theme ---------------------------------------------------------------------------
+
+const Theme& theme() { return g_theme; }
+void set_accent(int index) {
+    g_accent = std::clamp(index, 0, accent_count() - 1);
+    build_theme();
+}
+int accent_count() { return (int)(sizeof(ACCENTS) / sizeof(ACCENTS[0])); }
+const char* accent_name(int index) { return tr(ACCENTS[std::clamp(index, 0, accent_count() - 1)].name); }
+
+// --- frame --------------------------------------------------------------------------------
+
+void init() { build_theme(); }
+
+void begin_frame(Input& in, float dt) {
+    g_in = &in;
+    g_dt = std::min(dt, 0.1f);
+    g_time += g_dt;
+    g_frame++;
+    g_prev.swap(g_cur);
+    g_cur.clear();
+    g_tap_target = in.tap ? pick_tap_target(in.tx, in.ty) : 0;
+    g_layer = 0;
+    g_layer_stack.clear();
+    g_nav_suspended = false;
+    for (auto it = g_press.begin(); it != g_press.end();) {
+        it->second -= g_dt * 3.5f;
+        if (it->second <= 0) it = g_press.erase(it);
+        else ++it;
+    }
+    // Occasionally drop animation state for ids that disappeared.
+    if (g_frame % 600 == 0) {
+        for (auto it = g_anim.begin(); it != g_anim.end();) {
+            if (g_frame - it->second.last > 600) it = g_anim.erase(it);
+            else ++it;
+        }
+    }
+}
+
+void end_frame() {
+    do_navigation();
+}
+
+Input& input() { return *g_in; }
+float dt() { return g_dt; }
+double time() { return g_time; }
+uint64_t frame() { return g_frame; }
+
+// --- focus -------------------------------------------------------------------------------
+
+Item focusable(Id id, const Rect& r, Id group, int flags) {
+    Rect sr = gfx::to_screen(r);
+    Rect clip = gfx::current_clip();
+    g_cur.push_back(Reg{id, sr, clip, group, g_layer, flags});
+
+    Item it;
+    int top = top_layer(g_prev);
+    bool in_top = g_layer >= top;
+
+    if (in_top && g_in) {
+        bool visible = sr.intersects(clip);
+        auto hit = [&](float x, float y) { return visible && sr.contains(x, y) && clip.contains(x, y); };
+        if (g_in->pointer_moved && hit(g_in->px, g_in->py) && g_focus != id) {
+            g_focus = id;
+            g_last_focus_group = group;
+            if (group && !(flags & F_NO_MEMORY)) g_group_memory[group] = id;
+        }
+        if (g_in->long_press && hit(g_in->touch_start_x, g_in->touch_start_y) && g_focus != id) {  // the finger's item takes X
+            g_focus = id;
+            g_last_focus_group = group;
+            if (group && !(flags & F_NO_MEMORY)) g_group_memory[group] = id;
+        }
+        if (g_in->tap && (g_tap_target ? g_tap_target == id : hit(g_in->tx, g_in->ty))) {
+            g_focus = id;
+            g_last_focus_group = group;
+            if (group && !(flags & F_NO_MEMORY)) g_group_memory[group] = id;
+            it.clicked = true;
+            g_in->tap = false;
+        }
+    }
+
+    it.focused = (g_focus == id) && in_top;
+    if (it.focused && g_in && g_in->pressed_(BTN_A)) {
+        it.clicked = true;
+        g_in->eat(BTN_A);
+    }
+    if (it.clicked) {
+        g_press[id] = 1.0f;
+        audio::play(audio::SFX_SELECT);
+    }
+    auto p = g_press.find(id);
+    it.press = p != g_press.end() ? p->second : 0.0f;
+    it.f = spring(util::hash64("focus", id), it.focused ? 1.0f : 0.0f, 320.0f, 26.0f);
+    return it;
+}
+
+void reset_focus() {
+    g_focus = 0;
+    g_last_focus_group = 0;
+}
+
+void set_focus(Id id) {
+    g_focus = id;
+    g_focus_grace = 2;
+    if (const Reg* r = find(g_cur, id)) g_last_focus_group = r->group;
+}
+
+Id focused() { return g_focus; }
+
+bool focus_in_group(Id group) {
+    for (auto& r : g_cur)
+        if (r.id == g_focus) return r.group == group;
+    for (auto& r : g_prev)
+        if (r.id == g_focus) return r.group == group;
+    return false;
+}
+
+Id group_memory(Id group) {
+    auto it = g_group_memory.find(group);
+    return it == g_group_memory.end() ? 0 : it->second;
+}
+
+void forget_group(Id group) { g_group_memory.erase(group); }
+void set_group_entry(Id group, Id entry) { g_group_entry[group] = entry; }
+void suspend_nav() { g_nav_suspended = true; }
+
+void push_layer() {
+    g_layer_stack.push_back(g_layer);
+    g_layer = (int)g_layer_stack.size();
+}
+
+void pop_layer() {
+    if (g_layer_stack.empty()) return;
+    g_layer = g_layer_stack.back();
+    g_layer_stack.pop_back();
+}
+
+int layer() { return g_layer; }
+
+static float bump_curve() {
+    float t = (float)(g_time - g_bump_t);
+    if (t > 0.35f) return 0;
+    return std::sin(t * 38.0f) * std::exp(-t * 11.0f) * 7.0f;
+}
+
+float bump_x(Id id) { return id == g_bump_id ? bump_curve() * g_bump_dx : 0; }
+float bump_y(Id id) { return id == g_bump_id ? bump_curve() * g_bump_dy : 0; }
+
+// --- animation ------------------------------------------------------------------------------
+
+float tween(Id id, float target, float speed) {
+    AnimState& a = anim_state(id);
+    if (!a.init) {
+        a.v = target;
+        a.init = true;
+    }
+    a.v = anim::approach(a.v, target, speed, g_dt);
+    if (std::fabs(a.v - target) < 0.0005f) a.v = target;
+    return a.v;
+}
+
+float spring(Id id, float target, float stiffness, float damping) {
+    AnimState& a = anim_state(id);
+    if (!a.init) {
+        a.s.x = target;
+        a.init = true;
+    }
+    a.s.update(target, g_dt, stiffness, damping);
+    return a.s.x;
+}
+
+void set_value(Id id, float v) {
+    AnimState& a = anim_state(id);
+    a.v = v;
+    a.s.x = v;
+    a.s.v = 0;
+    a.init = true;
+}
+
+float scroll_follow(Id id, float a, float b, float view, float content, float margin, bool active) {
+    ScrollState& s = g_scroll[id];
+    float max_off = std::max(0.0f, content - view);
+    bool moving = s.dragging || s.fling != 0;
+    if (active && !moving && !s.free) {
+        if (a - margin < s.target) s.target = a - margin;
+        if (b + margin > s.target + view) s.target = b + margin - view;
+    }
+    s.target = std::clamp(s.target, 0.0f, max_off);
+    if (!s.init) {
+        s.s.x = s.target;
+        s.init = true;
+    }
+    if (moving) {
+        s.s.x = s.target;
+        s.s.v = 0;
+    } else {
+        s.s.update(s.target, g_dt, 170.0f, 26.0f);
+    }
+    return s.s.x;
+}
+
+float scroll_drag(Id id, const Rect& area, bool vertical, float content, float view) {
+    ScrollState& s = g_scroll[id];
+    float max_off = std::max(0.0f, content - view);
+    if (g_in) {
+        Rect sa = gfx::to_screen(area);
+        if (g_in->touch_began && sa.contains(g_in->tx, g_in->ty) && s.init) {
+            // Touching a moving list stops it, like on a phone; that touch doesn't open what's under it.
+            if (std::fabs(s.fling) > 250.0f || std::fabs(s.s.v) > 250.0f) s.caught = true;
+            s.fling = 0;
+            s.target = s.s.x;
+            s.s.v = 0;
+        }
+        bool axis = g_in->drag_axis == (vertical ? AXIS_Y : AXIS_X);
+        if (g_in->touching && g_in->dragging && axis && sa.contains(g_in->touch_start_x, g_in->touch_start_y)) {
+            // The first dragging frame catches up with the distance moved before it counted as a drag.
+            float d = g_in->drag_began ? (vertical ? g_in->ty - g_in->touch_start_y : g_in->tx - g_in->touch_start_x)
+                                       : (vertical ? g_in->tdy : g_in->tdx);
+            if (!s.dragging && s.init) s.target = s.s.x;
+            s.target -= d;
+            s.dragging = true;
+            s.free = true;
+            g_touch_scrolled = true;
+        } else if (s.dragging) {
+            s.dragging = false;
+            s.fling = -(vertical ? g_in->tvy : g_in->tvx);
+            if (std::fabs(s.fling) < 120.0f) s.fling = 0;
+            s.fling = std::clamp(s.fling, -6000.0f, 6000.0f);
+        }
+        if (g_in->touch_ended) {
+            if (s.caught) g_in->tap = false;
+            s.caught = false;
+        }
+        if (g_in->wheel != 0 && g_in->pointer && sa.contains(g_in->px, g_in->py)) s.target -= g_in->wheel * 90.0f;
+    }
+    if (s.fling != 0 && !s.dragging) {
+        // Momentum that slows down smoothly; it travels about fling / 3.2 pixels in all.
+        s.target += s.fling * g_dt;
+        s.fling *= std::exp(-3.2f * g_dt);
+        if (std::fabs(s.fling) < 25.0f || s.target <= 0 || s.target >= max_off) s.fling = 0;
+    }
+    s.target = std::clamp(s.target, 0.0f, max_off);
+    return s.target;
+}
+
+// --- chrome ------------------------------------------------------------------------------------
+
+void toast(const std::string& msg, int icon, Color c) {
+    if (c.a == 0) c = g_theme.accent;
+    if (!g_toasts.empty() && g_toasts.back().msg == msg) {
+        g_toasts.back().start = g_time;
+        return;
+    }
+    g_toasts.push_back(Toast{msg, icon, c, g_time});
+    if (g_toasts.size() > 3) g_toasts.pop_front();
+}
+
+// The ambient backdrop is drawn from a 64-pixel blur, so it needs no more than the small size a poster site keeps: Metahub's
+// "medium" background is a 1920x1080 progressive JPEG of about 900 KB (a title in focus asked for one on slow Wi-Fi in 6 s and
+// took a decoder thread), its "small" one a 480x270 baseline JPEG of 16 KB.
+static std::string small_backdrop(const std::string& url) {
+    static const char kMedium[] = "images.metahub.space/background/medium/";
+    const size_t at = url.find(kMedium);
+    if (at == std::string::npos) return url;
+    std::string out = url;
+    out.replace(at + std::string("images.metahub.space/background/").size(), 6, "small");
+    return out;
+}
+
+void set_backdrop(const std::string& original) {
+    const std::string url = small_backdrop(original);
+    if (url == g_backdrop) return;
+    g_prev_backdrop = g_backdrop;
+    g_backdrop = url;
+    g_backdrop_t = g_time;
+}
+
+void draw_background() {
+    gfx::fill_rect(Rect(0,0,W,H),g_theme.bg_top);
+}
+
+void draw_overlays() {
+    // Toasts: slide down from the top center.
+    float y = 22;
+    for (auto it = g_toasts.begin(); it != g_toasts.end();) {
+        float age = (float)(g_time - it->start);
+        const float life = 2.8f;
+        if (age > life) {
+            it = g_toasts.erase(it);
+            continue;
+        }
+        float in = anim::ease_out_back(age / 0.35f);
+        float out = 1.0f - anim::smoothstep((age - (life - 0.35f)) / 0.35f);
+        float a = std::min(1.0f, age / 0.15f) * out;
+        // Two lines when one would run past the screen's edges.
+        float pad = it->icon ? 76 : 48, tw = text::measure(font::body_bold, it->msg), max_tw = W - 200 - pad;
+        bool two = tw > max_tw;
+        float w = std::min(tw, max_tw) + pad, h = two ? 50 + text::line_height(font::body_bold) : 50;
+        Rect r(W * 0.5f - w * 0.5f, y - (1 - in) * 30, w, h);
+        gfx::push_alpha(a);
+        gfx::shadow(r, 22, Color(0, 0, 0, 150));
+        gfx::fill_rrect(r, 25, Color(28, 24, 34, 245));
+        gfx::stroke_rrect(r, 25, 1.5f, Color(255, 255, 255, 30));
+        float tx = r.x + 24;
+        if (it->icon) {
+            text::icon(it->icon, 24, tx + 10, r.cy(), it->color);
+            tx += 32;
+        }
+        if (two)
+            text::draw_wrapped(font::body_bold, Rect(tx, r.y + 12, max_tw, h - 12), it->msg, g_theme.text, 2);
+        else
+            text::draw(font::body_bold, tx, r.cy() - text::line_height(font::body_bold) * 0.5f, it->msg, g_theme.text);
+        gfx::pop_alpha();
+        y += (h + 10) * a;
+        ++it;
+    }
+
+    // Wii Remote / mouse pointer.
+    if (g_in && g_in->pointer && !g_in->touching && g_in->idle_time < 4.0) {
+        float a = std::clamp(4.0f - (float)g_in->idle_time, 0.0f, 1.0f);
+        gfx::push_alpha(a);
+        gfx::fill_circle(g_in->px, g_in->py, 11, Color(0, 0, 0, 90));
+        gfx::fill_circle(g_in->px, g_in->py, 8, Color(255, 255, 255, 235));
+        gfx::fill_circle(g_in->px, g_in->py, 4.5f, g_theme.accent);
+        gfx::pop_alpha();
+    }
+}
+
+void button_glyph(float cx, float cy, const char* button, float size) {
+    Color c = Color(255, 255, 255, 230);
+    float r = size * 0.5f;
+    bool wide = strlen(button) > 1;
+    Rect rr(cx - (wide ? r * 1.5f : r), cy - r, wide ? size * 1.5f : size, size);
+    gfx::stroke_rrect(rr, r, 1, g_theme.text2);
+    text::Font f{text::REGULAR, size * 0.55f};
+    text::draw(f, cx, cy - text::line_height(f) * 0.5f, button, c, text::CENTER);
+}
+
+void hint_bar(std::initializer_list<Hint> hints, float y) {
+    static const bool phone = platform::is_phone();  // taps, not buttons
+    if (phone) return;
+    const auto* fade=images::get(platform::content_dir()+"/ui/footer-fade.png",0,0,images::NO_EVICT);
+    if(fade&&fade->ready)gfx::image(fade->tex,Rect(80,H-80,W-80,80));
+    float x = W - 40;
+    for (auto it = std::rbegin(hints); it != std::rend(hints); ++it) {
+        float lw = text::measure(font::small_bold, it->label);
+        x -= lw;
+        text::draw(font::small_bold, x, y - text::line_height(font::small_bold) * 0.5f, it->label, g_theme.text2);
+        float gw = strlen(it->button) > 1 ? 36 : 24;
+        x -= 8 + gw * 0.5f;
+        button_glyph(x, y, it->button, 24);
+        x -= gw * 0.5f + 26;
+    }
+}
+
+// --- widgets ------------------------------------------------------------------------------------
+
+void spinner(float cx, float cy, float r, Color c, float width) {
+    float t = (float)g_time;
+    float head = t * 5.2f;
+    float len = 0.6f + 0.45f * (1.0f + std::sin(t * 2.6f));
+    gfx::stroke_circle(cx, cy, r, width, c.alpha(0.15f));
+    gfx::stroke_arc(cx, cy, r, head, head + len * 2.2f, width, c);
+}
+
+void skeleton(const Rect& r, float radius) {
+    float pulse = 0.5f + 0.5f * std::sin((float)g_time * 3.0f + r.x * 0.01f);
+    gfx::fill_rrect(r, radius, Color(255, 255, 255, (uint8_t)(12 + 10 * pulse)));
+    // A soft light band sweeping across.
+    float period = 1.6f;
+    float p = std::fmod((float)g_time + r.x * 0.0015f, period) / period;
+    float bw = r.w * 0.5f;
+    float bx = r.x - bw + (r.w + bw * 2) * p;
+    float x0 = std::max(r.x + radius * 0.5f, bx), x1 = std::min(r.r() - radius * 0.5f, bx + bw);
+    if (x1 > x0) {
+        float mid = bx + bw * 0.5f;
+        Color edge(255, 255, 255, 0), peak(255, 255, 255, 18);
+        Rect inner(x0, r.y + radius * 0.3f, x1 - x0, r.h - radius * 0.6f);
+        if (mid > x0 && mid < x1) {
+            gfx::fill_rect_hgrad(Rect(x0, inner.y, mid - x0, inner.h), gfx::lerp(edge, peak, (x0 - bx) / (bw * 0.5f)), peak);
+            gfx::fill_rect_hgrad(Rect(mid, inner.y, x1 - mid, inner.h), peak, gfx::lerp(peak, edge, (x1 - mid) / (bw * 0.5f)));
+        }
+    }
+}
+
+void focus_ring(const Rect& r, float radius, float f) {
+    if (f <= 0.01f) return;
+    float grow = 2;
+    Rect rr(r.x - grow, r.y - grow, r.w + grow * 2, r.h + grow * 2);
+    gfx::stroke_rrect(rr, radius + grow, 2, g_theme.accent.alpha(f));
+}
+
+void focus_glow(const Rect& r, float f) {
+    if (f <= 0.01f) return;
+    // The revised design uses a precise outline rather than a diffuse halo.
+}
+
+float measure_button(const char* label, int icon) {
+    float w = label && *label ? text::measure(font::label, label) + 32 : 0;
+    if (icon) w += label && *label ? 34 : 48;
+    return w;
+}
+
+bool button(Id id, const Rect& r, const char* label, int icon, int style, Id group, int flags) {
+    Item it = focusable(id, r, group, flags);
+    float s = 1.0f - 0.02f * it.press;
+    Rect br = r.scaled(s).offset(bump_x(id), bump_y(id));
+    const Theme& t = g_theme;
+    float rad = 0;
+
+    if (it.f > 0.01f) gfx::shadow(br, 18, Color(0, 0, 0, (uint8_t)(120 * it.f)));
+    Color fg;
+    if (style == BTN_PRIMARY) {
+        gfx::fill_rect(br, t.accent);
+        if (it.f > 0.01f) gfx::stroke_rrect(br.inset(-2), 0, 2, t.text.alpha(it.f));
+        fg = t.bg_top;
+    } else if (style == BTN_TAB) {
+        gfx::fill_rect(br,t.surface_hi.alpha(it.f*.5f));
+        gfx::stroke_rrect(br,0,2,t.accent);
+        fg=t.accent;
+    } else if (style == BTN_GHOST) {
+        gfx::fill_rrect(br, rad, gfx::lerp(Color(255, 255, 255, 0), t.surface_focus, it.f));
+        fg = gfx::lerp(t.text, gfx::rgb(0x111513), it.f);
+    } else {
+        gfx::fill_rrect(br, rad, gfx::lerp(t.bg_top, t.surface_focus, it.f));
+        gfx::stroke_rrect(br,0,1,t.surface_hi);
+        fg = gfx::lerp(t.text, gfx::rgb(0x111513), it.f);
+        if (style == BTN_DANGER) fg = gfx::lerp(t.bad, gfx::rgb(0xB91C1C), it.f);
+    }
+    if (style == BTN_PRIMARY) {
+        fg = gfx::rgb(0x111513);
+    }
+
+    float cw = measure_button(label, icon) - 32 + (icon && !(label && *label) ? -16 : 0);
+    float x = br.cx() - cw * 0.5f;
+    if (icon) {
+        float isz = 24;
+        if (label && *label) {
+            text::icon(icon, isz, x + 12, br.cy(), fg);
+            x += 34;
+        } else {
+            text::icon(icon, isz, br.cx(), br.cy(), fg);
+        }
+    }
+    if (label && *label)
+        text::draw(font::label, x, br.cy() - text::line_height(font::label) * 0.5f, label, fg);
+    return it.clicked;
+}
+
+bool icon_button(Id id, float cx, float cy, float radius, int icon, Id group, int flags, bool active) {
+    Rect r(cx - radius, cy - radius, radius * 2, radius * 2);
+    Item it = focusable(id, r, group, flags);
+    float s = 1.0f - 0.04f * it.press;
+    float rr = radius * s;
+    const Theme& t = g_theme;
+    cx += bump_x(id);
+    cy += bump_y(id);
+    if (it.f > 0.01f) gfx::shadow(Rect(cx - rr, cy - rr, rr * 2, rr * 2), 16, Color(0, 0, 0, (uint8_t)(110 * it.f)));
+    Color bg = active ? t.accent : t.surface_hi;
+    gfx::fill_circle(cx, cy, rr, gfx::lerp(bg, t.surface_focus, it.f));
+    Color fg = gfx::lerp(active ? gfx::rgb(0x111513) : t.text, gfx::rgb(0x111513), it.f);
+    text::icon(icon, active?48:32, cx, cy, fg);
+    return it.clicked;
+}
+
+bool chip(Id id,const Rect& r,const char* label,bool selected,Id group,int icon) {
+    return button(id,r,label,icon,selected?BTN_TAB:BTN_NORMAL,group);
+}
+
+static void row_base(const Rect& r, const Item& it, Id id) {
+    const Theme& t = g_theme;
+    Rect br = r.offset(bump_x(id), bump_y(id));
+    if (it.f > 0.01f) gfx::shadow(br, 16, Color(0, 0, 0, (uint8_t)(100 * it.f)));
+    gfx::fill_rrect(br, 0, gfx::lerp(t.surface, t.surface_focus, it.f));
+}
+
+bool toggle_row(Id id, const Rect& r, const char* label, const char* desc, bool* value, Id group, int flags) {
+    Item it = focusable(id, r, group, flags);
+    if (it.clicked) {
+        *value = !*value;
+        audio::play(*value ? audio::SFX_TOGGLE : audio::SFX_TOGGLE_OFF);
+    }
+    row_base(r, it, id);
+    const Theme& t = g_theme;
+    Color fg = gfx::lerp(t.text, gfx::rgb(0x111513), it.f);
+    Color fg2 = gfx::lerp(t.text2, Color(17, 21, 19, 170), it.f);
+    Rect br = r.offset(bump_x(id), bump_y(id));
+    float ty = desc && *desc ? br.y + 14 : br.cy() - text::line_height(font::label) * 0.5f;
+    text::draw_fit(font::label, br.x + 24, ty, br.w - 140, label, fg);
+    if (desc && *desc) text::draw_fit(font::small, br.x + 24, ty + 30, br.w - 140, desc, fg2);
+
+    float on = tween(ui::id(id, "knob"), *value ? 1.0f : 0.0f, 16.0f);
+    Rect track(br.r() - 24 - 56, br.cy() - 16, 56, 32);
+    gfx::fill_rrect(track, 16, gfx::lerp(Color(120, 120, 130, 110), t.accent, on));
+    float kx = track.x + 16 + on * 24;
+    gfx::fill_circle(kx, track.cy() + 1, 13, Color(0, 0, 0, 60));
+    gfx::fill_circle(kx, track.cy(), 12.5f, gfx::WHITE);
+    return it.clicked;
+}
+
+bool value_row(Id id, const Rect& r, const char* label, const char* value, int icon, Id group, int flags) {
+    Item it = focusable(id, r, group, flags);
+    row_base(r, it, id);
+    const Theme& t = g_theme;
+    Color fg = gfx::lerp(t.text, gfx::rgb(0x111513), it.f);
+    Color fg2 = gfx::lerp(t.text2, Color(17, 21, 19, 170), it.f);
+    Rect br = r.offset(bump_x(id), bump_y(id));
+    float x = br.x + 24;
+    if (icon) {
+        text::icon(icon, 26, x + 12, br.cy(), fg);
+        x += 40;
+    }
+    // The label gets the room it needs, as long as the value keeps some.
+    const float edge = (flags & F_INFO) ? 28.0f : 52.0f;  // what is kept clear on the right (the arrow's room)
+    float room = br.r() - edge - x - 24, vw = 0;
+    if (value && *value) {
+        float lw = text::measure(font::label, label);
+        vw = std::min({text::measure(font::body, value), br.w * 0.5f, std::max(room - lw, room * 0.35f)});
+        text::draw_fit(font::body, br.r() - edge - vw, br.cy() - text::line_height(font::body) * 0.5f, vw, value, fg2);
+    }
+    text::draw_fit(font::label, x, br.cy() - text::line_height(font::label) * 0.5f, room - vw, label, fg);
+    if (!(flags & F_INFO)) text::icon(ic::CHEVRON_RIGHT, 26, br.r() - 30, br.cy(), fg2);
+    return it.clicked;
+}
+
+namespace {
+Id g_slider_drag = 0;  // the slider a finger is on
+}
+
+// The slider's input and drawing, for a slider that has (or has not) the focus.
+static bool slider_core(Id id, const Rect& r, float* value, float step, bool focused, bool draw_focus) {
+    const Theme& t = g_theme;
+    bool changed = false;
+    Input& in = *g_in;
+    auto set = [&](float v) {
+        v = std::clamp(std::round(v / step) * step, 0.0f, 1.0f);
+        if (std::fabs(v - *value) > 1e-4f) {
+            *value = v;
+            changed = true;
+        }
+    };
+    if (focused) {
+        if (in.rep(BTN_LEFT)) { in.eat(BTN_LEFT); set(*value - step); }
+        if (in.rep(BTN_RIGHT)) { in.eat(BTN_RIGHT); set(*value + step); }
+    }
+    if (in.touch_began && Rect(r.x - 20, r.y - 16, r.w + 40, r.h + 32).contains(in.tx, in.ty)) g_slider_drag = id;
+    if (g_slider_drag == id) {
+        set((in.tx - r.x) / r.w);
+        in.tap = false;  // dragging a slider is not a tap on what is under it
+        if (!in.touching) g_slider_drag = 0;
+    }
+    const float v = std::clamp(*value, 0.0f, 1.0f);
+    const float th = 8, cy = r.cy();
+    gfx::fill_rrect(Rect(r.x, cy - th * 0.5f, r.w, th), th * 0.5f, Color(255, 255, 255, focused ? 70 : 45));
+    if (v > 0) gfx::fill_rrect_hgrad(Rect(r.x, cy - th * 0.5f, std::max(th, r.w * v), th), th * 0.5f, t.accent, t.accent2);
+    const float kr = focused && draw_focus ? 13.0f : 10.0f;
+    gfx::fill_circle(r.x + r.w * v, cy + 1, kr + 2, Color(0, 0, 0, 70));
+    gfx::fill_circle(r.x + r.w * v, cy, kr, gfx::WHITE);
+    return changed;
+}
+
+bool slider(Id id, const Rect& r, float* value, float step, Id group, int flags, bool draw_focus) {
+    const Item it = focusable(id, r, group, flags);
+    return slider_core(id, r, value, step, it.focused, draw_focus);
+}
+
+bool slider_row(Id id, const Rect& r, const char* label, float* value, float step, Id group, int flags) {
+    const Item it = focusable(id, r, group, flags);
+    row_base(r, it, id);
+    const Theme& t = g_theme;
+    const Color fg = gfx::lerp(t.text, gfx::rgb(0x111513), it.f);
+    const Color fg2 = gfx::lerp(t.text2, Color(17, 21, 19, 170), it.f);
+    const Rect br = r.offset(bump_x(id), bump_y(id));
+    const float track_x = br.x + br.w * 0.46f, track_w = br.w * 0.54f - 110;
+    text::draw_fit(font::label, br.x + 24, br.cy() - text::line_height(font::label) * 0.5f, track_x - br.x - 40, label, fg);
+    const std::string pct = std::to_string((int)std::round(*value * 100)) + "%";
+    text::draw(font::body, br.r() - 28, br.cy() - text::line_height(font::body) * 0.5f, pct, fg2, text::RIGHT);
+    return slider_core(id, Rect(track_x, br.cy() - 14, track_w, 28), value, step, it.focused, false);
+}
+
+void progress_bar(const Rect& r, float progress, float buffered, bool knob, float knob_scale) {
+    const Theme& t = g_theme;
+    progress = std::clamp(progress, 0.0f, 1.0f);
+    buffered = std::clamp(buffered, 0.0f, 1.0f);
+    float rad = r.h * 0.5f;
+    gfx::fill_rrect(r, rad, t.surface_hi);
+    if (buffered > progress) gfx::fill_rrect(Rect(r.x, r.y, r.w * buffered, r.h), rad, t.border);
+    if (progress > 0) gfx::fill_rrect(Rect(r.x,r.y,std::max(r.h,r.w*progress),r.h),rad,t.accent);
+    if (knob) {
+        float kx = r.x + r.w * progress, ks = 7 * knob_scale;
+        gfx::fill_circle(kx, r.cy() + 1, ks + 1.5f, Color(0, 0, 0, 80));
+        gfx::fill_circle(kx, r.cy(), ks, t.accent);
+    }
+}
+
+}  // namespace ui

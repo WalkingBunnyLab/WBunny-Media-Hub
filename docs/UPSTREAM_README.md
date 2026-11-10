@@ -1,0 +1,138 @@
+<p align="center">
+  <img src="branding/store_screen.png" alt="CoffeeFlix" width="100%">
+</p>
+
+# CoffeeFlix
+
+A media app for the Wii U. It plays YouTube, Twitch, your Jellyfin server, internet radio, podcasts, and whatever you have on the SD card or on a computer on your network, all from one place on the TV or the GamePad.
+
+**Download:** [roastedd.github.io/CoffeeFlix](https://roastedd.github.io/CoffeeFlix/) or the [latest release](https://github.com/roastedd/coffeeflix/releases/latest).
+
+CoffeeFlix is free. If you enjoy it, you can [buy me a coffee on Ko-fi](https://ko-fi.com/ubecatstudio). ☕
+
+## What it does
+
+- **YouTube** without signing in. Subscriptions live on your SD card, and so does the *For you* feed, which learns from what you watch without sending anything anywhere. You get channel pages (videos, Shorts, live, playlists), search, *Watch later*, history, captions and [SponsorBlock](https://sponsor.ajay.app) skipping. Pick 360p to 1080p from the player; 720p is the default. Videos with dubbed audio play in their original language, and the player lists the dubs if you'd rather hear one.
+- **Jellyfin**: sign in with Quick Connect or a password. Continue watching, next up, seasons and episodes, server subtitles, and your progress syncs back to the server. When an episode ends, the next one starts after a countdown you can cancel (and YouTube can do the same with its suggested video).
+- **Twitch**: live channels, search and a follow list, at the quality you choose.
+- **Radio**: the 40,000+ stations of radio-browser.info, by country or genre, with the song that's playing.
+- **Podcasts**: search Apple's directory, subscribe, and pick up episodes where you left off.
+- **Your own files**: videos (with `.srt` subtitles), music, photos, and comics and books (CBZ, EPUB) from the SD card, from a Windows, Mac or NAS share (SMB), or from a DLNA server such as Plex, which it finds on its own. You can also send files to the SD card from your phone or computer over Wi-Fi (*My Media > Receive files*).
+- A Home screen and search that cover all of the above, and music that keeps playing while you browse.
+- In English, Tagalog, Spanish, French, German, Italian, Portuguese, Dutch, Japanese, Chinese and Korean. It follows the Wii U's language, or you can pick one under *Settings > Language*.
+
+## Installing
+
+1. Download the zip from the website or the releases page.
+2. Extract it to the root of your SD card. The app ends up in `sd:/wiiu/apps/coffeeflix/`.
+3. Start CoffeeFlix from the Wii U Menu. You need [Aroma](https://aroma.foryour.cafe).
+
+Still on Tiramisu? Download `coffeeflix-tiramisu.zip` from the releases page instead, extract it the same way and start CoffeeFlix from the Homebrew Launcher. It's newer and less tested than the Aroma version, so please report any problems.
+
+For local media, put files in the `Videos`, `Music`, `Photos` and `Books` folders the app creates next to itself.
+
+### Connecting things
+
+- **Jellyfin**: enter your server's address, like `http://192.168.1.20:8096`, then approve the Quick Connect code from the Jellyfin app on your phone, or type your password.
+- **Network shares**: *My Media > Network shares > Add share*. Enter the computer's IP address (or `\\host\share`), the share name and your login; leave the login empty for guest shares.
+- **DLNA servers** appear under *My Media > Media servers* once sharing is turned on in the server.
+- **Each Wii U user signs in on their own**: Jellyfin and YouTube sign-ins belong to the Wii U user who started CoffeeFlix, so everyone in the house can use their own accounts. Settings, network shares and what's saved on the SD card are shared.
+- **Your YouTube subscriptions**: get `subscriptions.csv` from [Google Takeout](https://takeout.google.com) (*YouTube and YouTube Music > subscriptions*), or a NewPipe or LibreTube export saved as `subscriptions.json`. Put it in `sd:/wiiu/apps/coffeeflix/` and choose *Settings > Import YouTube subscriptions*.
+
+## Controls
+
+The GamePad (including the touch screen), Pro Controller, Classic Controller and Wii Remote all work.
+
+| Button | Anywhere |
+|--------|----------|
+| D-Pad / left stick | Move |
+| A | Select |
+| B | Back. At the top of a section it opens the sidebar; press it again to go Home |
+| X | The action shown at the bottom right. On a YouTube video it opens a menu: go to the channel, subscribe, *Watch later*, *Not interested* |
+| Y | On a YouTube video: *Not interested* |
+| + | *Now Playing*, while music or radio plays in the background |
+
+| Button | Video player |
+|--------|--------------|
+| A | Play / pause |
+| D-Pad left / right | Back / forward 10 seconds |
+| L, ZL / R, ZR | Back / forward 30 seconds |
+| Y | Subtitles |
+| X | Audio track (on YouTube, the language) |
+| D-Pad up / down | Show the controls: quality, subtitles and, on YouTube, *Subscribe* |
+| B | Close |
+
+In photos, L and R flip through pictures, A zooms and Y starts a slideshow. In the reader, L and R turn pages and Y switches between fitting the page and the width. Books reopen where you stopped.
+
+## Settings
+
+Language, accent color, sounds, screensaver, default quality for YouTube, Jellyfin and Twitch, 60 fps video, how the Wii U decodes video, subtitles and captions, SponsorBlock, your region, and importing or exporting YouTube subscriptions. They're saved in `sd:/wiiu/apps/coffeeflix/coffeeflix.json`.
+
+## Formats and tips
+
+The Wii U decodes H.264 in hardware, up to 1080p. Everything else (HEVC, VP8/VP9, MPEG-1/2/4) is decoded on the CPU and is only smooth at 480p or so. If a local file stutters, convert it:
+
+```bash
+ffmpeg -i input.mkv -map 0 -c:v libx264 -profile:v high -level 4.0 -pix_fmt yuv420p \
+  -preset medium -crf 21 -vf "scale=-2:720" -c:a aac -b:a 192k -c:s copy output.mkv
+```
+
+Audio can be MP3, AAC, FLAC, Vorbis, Opus, ALAC, WavPack, WAV or AC-3 (surround is mixed down to stereo). Subtitles can be embedded SRT, ASS, WebVTT or mov_text, or an `.srt` file next to the video. Jellyfin plays what the Wii U can handle directly and has the server convert the rest.
+
+If a video stutters, lower the quality from the player. 60 fps video is off by default because it's twice the work for the console; YouTube only has 30 fps versions of 60 fps videos up to 480p.
+
+If the Wii U's hardware decoder gives no picture, the player switches to a safer mode by itself (hardware decoding without B-frames, then software decoding) and remembers it. You can change it back under *Settings > Video decoding*.
+
+**If something goes wrong**, CoffeeFlix writes a log of every run to `sd:/wiiu/apps/coffeeflix/coffeeflix.log`, and keeps the one before as `coffeeflix-previous.log` (the one you want after a freeze). Please attach it when you report a problem.
+
+## Building
+
+GitHub Actions builds every push ([build.yml](.github/workflows/build.yml)). Pushing a numeric `v*` tag prepares a **draft** release with a source manifest and checksums. Public release requires device testing and explicit approval; see [the release process](docs/RELEASING.md).
+
+To build it yourself, Docker is enough:
+
+```bash
+tools/docker-build.sh            # the first run also builds FFmpeg-wiiu and libsmb2 into deps/
+tools/docker-build.sh DEBUG=1    # debug build
+```
+
+With devkitPro installed (`wut`, `wiiu-sdl2*`, `wiiu-curl`, `ppc-jansson`, `ppc-tinyxml2`, `ppc-giflib`, `ppc-libzip`, `ppc-libjpeg-turbo`), run `tools/build-deps.sh` once and then `make`. `WIIU_IP=192.168.x.x tools/deploy.sh` copies a build to a Wii U running an FTP server.
+
+FFmpeg-wiiu is patched during the build; the patches are in [tools/patches](tools/patches).
+
+### Choosing a developer build
+
+A developer update server can offer multiple local checkouts at once:
+
+```bash
+tools/dev-update.sh --no-build --also-project /path/to/another/checkout
+```
+
+With Developer updates enabled, **Settings > Updates > Build to install** lists the signed builds offered by that server. Select a build, download it, then choose **Install and close**. Cancel a pending download or staged installation before selecting another build. Automatic updates only update the current build variant; they do not switch variants.
+
+Each checkout identifies its variant in `src/core/build_variant.hpp`. Build each checkout before offering it. Older clients receive the server's primary build once, gaining the chooser after installation. The installed application still occupies one Wii U slot.
+
+### Translations
+
+The interface text is English in the code, wrapped in `tr("...")`, and each language has a file in [content/lang](content/lang) that maps it to that language. `tools/i18n.py` shows what each language is missing and catches mistakes, and `tools/i18n.py update` adds new text to every file. Corrections from native speakers are welcome.
+
+## Support
+
+CoffeeFlix is free and made in my spare time. If it's become part of your Wii U setup and you'd like to say thanks, you can [support it on Ko-fi](https://ko-fi.com/ubecatstudio). Bug reports and ideas in the [issues](https://github.com/Roastedd/CoffeeFlix/issues) help just as much.
+
+## License
+
+CoffeeFlix is source-available under the [PolyForm Noncommercial License 1.0.0](LICENSE.md). You can use it, change it and share it for anything noncommercial. Selling it or building it into a commercial product needs permission.
+
+The libraries, fonts and data it includes keep their own licenses. They're listed in [content/licenses](content/licenses/NOTICES.txt), which also ships inside the app (*Settings > Licenses*). FFmpeg and libsmb2 are LGPL: you can change them and rebuild CoffeeFlix with your versions using this repository.
+
+## Credits
+
+- [devkitPro](https://github.com/devkitPro): the toolchain, wut and the Wii U SDL2 port
+- [FFmpeg](https://github.com/FFmpeg/FFmpeg), and [FFmpeg-wiiu](https://github.com/GaryOderNichts/FFmpeg-wiiu) by GaryOderNichts for hardware H.264
+- [libsmb2](https://github.com/sahlberg/libsmb2) by Ronnie Sahlberg
+- Inter by Rasmus Andersson (SIL OFL) and Material Icons by Google (Apache 2.0)
+- The [radio-browser.info](https://www.radio-browser.info) station directory
+- [SponsorBlock](https://sponsor.ajay.app) segment data (CC BY-NC-SA 4.0)
+- Boot sound: "Game-Main-Menu-Fluids" by [LightMister](https://freesound.org/people/LightMister/sounds/769925/) (CC0)
+- CoffeeFlix began as a fork of [cafemp](https://github.com/whateveritwas/cafemp) by whateveritwas and has since been rewritten.
