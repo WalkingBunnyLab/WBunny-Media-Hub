@@ -14,8 +14,10 @@ Developed and independently maintained by Walking Bunny Lab.
 ## Source-sharing scope
 
 This repository is for source sharing and technical discussion, particularly
-review of the Bilibili integration by CoffeeFlix's author. It does not provide
-precompiled installation packages or official releases.
+review of the Bilibili integration by CoffeeFlix's author. Precompiled packages
+are kept out of Git history. The [0.4.0-alpha.3 pre-release](https://github.com/WalkingBunnyLab/WBunny-Media-Hub/releases/tag/v0.4.0-alpha.3)
+separately provides the original WBunny UI installation package for experimental
+hardware testing; it is not a formally accepted stable release.
 
 The source-sharing export omits WBunny logos, launch artwork, Figma exports,
 screenshots, and decorative UI images. All C++ sources, Bilibili adapters and
@@ -77,7 +79,14 @@ are not exposed by the first milestone. Plex is not implemented.
 
 ## Local development builds
 
-No precompiled WUHB or installation ZIP is provided by this source repository.
+For the original WBunny interface, download the installation ZIP from the
+[alpha pre-release](https://github.com/WalkingBunnyLab/WBunny-Media-Hub/releases/tag/v0.4.0-alpha.3)
+and extract its `wiiu/` directory to the SD card root. That binary includes WBunny
+artwork intentionally omitted from the source-sharing snapshot. The public
+snapshot uses upstream fallback artwork, so it does not reproduce the binary's
+visual assets byte for byte. Corresponding linked-library sources and rebuild
+instructions are included as a separate pre-release asset.
+
 When building locally for Aroma, the application uses:
 
     sd:/wiiu/apps/wbunny-media-hub/wbunny-media-hub.wuhb
